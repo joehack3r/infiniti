@@ -1,0 +1,294 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: |
+  Create website serving static page. This template assumes use of a Default VPC for deployment.
+
+Parameters:
+  AmiId:
+    Description: Amazon Linux AMI ID.
+    Type: AWS::EC2::Image::Id
+    AllowedPattern: "^ami-(?=[0-9a-f]*$)(?:.{8})$"
+    Default: ami-6057e21a
+  DisplayText:
+    Description: |
+      Text to display on the website.
+    Type: String
+    Default: To infiniti and beyond!
+  Environment:
+    Description: Environment name - no spaces or underscored allowed.
+    Type: String
+    AllowedPattern: "[-a-zA-Z0-9]*"
+    Default: prod
+  WebServerInstanceCountMin:
+    Description: Minimum number of instances in auto scaling group.
+    Type: String
+    Default: "2"
+  WebServerInstanceCountMax:
+    Description: Maximum number of instances in auto scaling group.
+    Type: String
+    Default: "2"
+  WebServerInstanceType:
+    Description: Web Server EC2 instance type.
+    Type: String
+    ConstraintDescription: Must be a valid EC2 instance type.
+    Default: t2.nano
+
+Resources:
+  ElbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public facing ELB security group.
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: "80"
+        ToPort: "80"
+        CidrIp: 0.0.0.0/0
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Web server security group.
+  ElbEgressToWebServerPort80:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId:
+        !GetAtt ElbSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: "80"
+      ToPort: "80"
+      DestinationSecurityGroupId:
+        !GetAtt WebServerSecurityGroup.GroupId
+  WebServerIngressFromElbPort80:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId:
+        !GetAtt WebServerSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: "80"
+      ToPort: "80"
+      SourceSecurityGroupId:
+        !GetAtt ElbSecurityGroup.GroupId
+  WebServerElasticLoadBalancer:
+    Type: AWS::ElasticLoadBalancing::LoadBalancer
+    DependsOn:
+    - ElbSecurityGroup
+    Properties:
+      ConnectionDrainingPolicy:
+        Enabled: "True"
+      CrossZone: "true"
+      LoadBalancerName:
+        !Join
+        - ""
+        - - !Ref AWS::StackName
+          - -homework-
+          - !Ref Environment
+          - -elb
+      AvailabilityZones:
+        !GetAZs ""
+      Listeners:
+      - LoadBalancerPort: "80"
+        Protocol: HTTP
+        InstancePort: "80"
+        InstanceProtocol: HTTP
+      HealthCheck:
+        Target: HTTP:80/
+        HealthyThreshold: "3"
+        UnhealthyThreshold: "5"
+        Interval: "30"
+        Timeout: "5"
+      SecurityGroups:
+        - !GetAtt ElbSecurityGroup.GroupId
+      Tags:
+      - Key: environment
+        Value:
+          !Ref Environment
+      - Key: product
+        Value: homework
+      - Key: role
+        Value: elb
+
+  DescribeHealthRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: describe-instance-health-policy
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+            - elasticloadbalancing:DescribeInstanceHealth
+            Resource: "*"
+  WebServerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles:
+      - Ref: DescribeHealthRole
+
+  WebServerLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    DependsOn:
+    - WebServerElasticLoadBalancer
+    Metadata:
+      Comment: Install Nginx and serve a single static file.
+      AWS::CloudFormation::Init:
+        configSets:
+          first_install:
+          - install_cfn
+          - install_nginx
+          - create_static_file
+          - verify_instance_health
+          subsequent_installs:
+          - create_static_file
+        install_cfn:
+          files:
+            "/etc/cfn/cfn-hup.conf":
+              content:
+                !Join
+                - ""
+                - - "[main]\n"
+                  - stack=
+                  - !Ref AWS::StackId
+                  - "\n"
+                  - region=
+                  - !Ref AWS::Region
+                  - "\n"
+                  - "interval=1\n"
+                  - "verbose=true\n"
+              mode: "000400"
+              owner: root
+              group: root
+            "/etc/cfn/hooks.d/cfn-auto-reloader.conf":
+              content:
+                !Join
+                - ""
+                - - "[cfn-auto-reloader-hook]\n"
+                  - "triggers=post.update\n"
+                  - "path=Resources.WebServerLaunchConfig.Metadata.AWS::CloudFormation::Init\n"
+                  - "action=/opt/aws/bin/cfn-init -v "
+                  - " --stack "
+                  - !Ref AWS::StackName
+                  - " --resource WebServerLaunchConfig "
+                  - " --configsets subsequent_installs "
+                  - " --region "
+                  - !Ref AWS::Region
+                  - "\n"
+                  - "runas=root\n"
+        install_nginx:
+          packages:
+            yum:
+              nginx: []
+          services:
+            sysvinit:
+              nginx:
+                enabled: "true"
+                ensureRunning: "true"
+                files:
+                - "/etc/nginx/nginx.conf"
+        create_static_file:
+          files:
+            "/usr/share/nginx/html/index.html":
+              content:
+                !Join
+                - "\n"
+                - - <h1>
+                  - !Ref DisplayText
+                  - </h1>
+              mode: "000644"
+              owner: root
+              group: root
+        verify_instance_health:
+          commands:
+            ELBHealthCheck:
+              command:
+                Fn::Join:
+                - ""
+                - - "until [ \"$state\" = \"\\\"InService\\\"\" ]; do"
+                  - " state=$(aws --region "
+                  - Ref: AWS::Region
+                  - " elb describe-instance-health "
+                  - " --load-balancer-name "
+                  - Ref: WebServerElasticLoadBalancer
+                  - " --instances $(curl -s http://169.254.169.254/latest/meta-data/instance-id) "
+                  - " --query InstanceStates[0].State); "
+                  - " sleep 10; "
+                  - "done"
+    Properties:
+      ImageId:
+        !Ref AmiId
+      InstanceMonitoring: "false"
+      InstanceType:
+        !Ref WebServerInstanceType
+      SecurityGroups:
+      - !Ref WebServerSecurityGroup
+      IamInstanceProfile:
+        !Ref WebServerInstanceProfile
+      UserData:
+        Fn::Base64:
+          !Join
+          - ""
+          - - "#!/bin/bash -v\n"
+            - "# Capture UserData script output in multiple locations for easier debugging\n"
+            - "# http://alestic.com/2010/12/ec2-user-data-output\n"
+            - "exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1\n"
+            - "/opt/aws/bin/cfn-init -v "
+            - " --stack "
+            - !Ref AWS::StackName
+            - " --resource WebServerLaunchConfig "
+            - " --configsets first_install"
+            - " --region "
+            - !Ref AWS::Region
+            - "\n"
+            - "/opt/aws/bin/cfn-signal -e $? "
+            - " --stack "
+            - !Ref AWS::StackName
+            - " --resource WebServerAutoScalingGroup "
+            - " --region "
+            - !Ref AWS::Region
+            - "\n"
+            - "# Start up the cfn-hup daemon to listen for changes to the metadata\n"
+            - "/opt/aws/bin/cfn-hup --config /etc/cfn --verbose\n"
+            - "\n"
+  WebServerAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AvailabilityZones:
+        !GetAZs ""
+      LaunchConfigurationName:
+        !Ref WebServerLaunchConfig
+      MinSize:
+        !Ref WebServerInstanceCountMin
+      MaxSize:
+        !Ref WebServerInstanceCountMax
+      LoadBalancerNames:
+      - !Ref WebServerElasticLoadBalancer
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+        Count: "1"
+    UpdatePolicy:
+      AutoScalingScheduledAction:
+        IgnoreUnmodifiedGroupSizeProperties: "true"
+      AutoScalingRollingUpdate:
+        MinInstancesInService: "1"
+        MaxBatchSize: "1"
+        WaitOnResourceSignals: "true"
+        PauseTime: PT15M
+
+Outputs:
+  WebserverURL:
+    Description: URL to access Web Server.
+    Value:
+      Fn::Join:
+      - ""
+      - - http://
+        - !GetAtt WebServerElasticLoadBalancer.DNSName
